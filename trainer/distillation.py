@@ -81,7 +81,7 @@ class Trainer:
             self.model.fake_score.requires_grad_(False)
             lora_config = LoraConfig(
                 r=config.lora_rank,
-                target_modules="*" # everything
+                target_modules="*", # everything
                 lora_alpha=config.lora_rank,
                 lora_dropout=0.0,
                 bias="none",
