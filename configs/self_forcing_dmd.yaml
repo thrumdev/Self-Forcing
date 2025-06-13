@@ -47,5 +47,7 @@ trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
+lora_rank: 64
 model_kwargs:
   timestep_shift: 5.0
+num_workers: 8

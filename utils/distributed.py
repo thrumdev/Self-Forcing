@@ -12,6 +12,7 @@ def fsdp_state_dict(model):
     fsdp_fullstate_save_policy = FullStateDictConfig(
         offload_to_cpu=True, rank0_only=True
     )
+
     with FSDP.state_dict_type(
         model, StateDictType.FULL_STATE_DICT, fsdp_fullstate_save_policy
     ):

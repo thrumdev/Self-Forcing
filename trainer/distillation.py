@@ -16,6 +16,8 @@ import wandb
 import time
 import os
 
+from peft import get_peft_model, LoraConfig
+
 
 class Trainer:
     def __init__(self, config):
@@ -69,6 +71,31 @@ class Trainer:
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
+
+        # Wrap the generator and fake score models with Lora before FSDP wrapping
+        if config.lora_rank is not None:
+            print("Initializing LoRA for generator and fake score")
+
+            # Disable gradients for the generator and fake score
+            self.model.generator.requires_grad_(False)
+            self.model.fake_score.requires_grad_(False)
+            lora_config = LoraConfig(
+                r=config.lora_rank,
+                target_modules="*" # everything
+                lora_alpha=config.lora_rank,
+                lora_dropout=0.0,
+                bias="none",
+            )
+            self.model.generator = get_peft_model(
+                self.model.generator,
+                lora_config,
+            )
+            self.model.fake_score = get_peft_model(
+                self.model.fake_score,
+                lora_config,
+            )
+            self.model.generator.print_trainable_parameters()
+            self.model.fake_score.print_trainable_parameters()
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -169,15 +196,30 @@ class Trainer:
                 state_dict, strict=True
             )
 
+        self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
+        self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.previous_time = None
+
+        if config.total_batch_size is not None:
+            if config.num_workers is None:
+                config.num_workers = 1
+
+            dist_batch_per_step = config.batch_size * config.num_workers
+            assert config.total_batch_size % dist_batch_per_step == 0, \
+                "Total batch size must be divisible by batch size for gradient accumulation"
+            self.accumulation_steps = config.total_batch_size / dist_batch_per_step
+        else:
+            self.accumulation_steps = 1
+
+        # update some config parameters to account for gradient accumulation
+        self.config.ema_start_step *= self.accumulation_steps
+        self.config.dfake_gen_update_ratio *= self.accumulation_steps
+
         ##############################################################################################################
 
         # Let's delete EMA params for early steps to save some computes at training and inference
         if self.step < config.ema_start_step:
             self.generator_ema = None
-
-        self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
-        self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
-        self.previous_time = None
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -250,6 +292,7 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
+            generator_loss /= self.accumulation_steps  # gradient accumulation
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
@@ -270,6 +313,7 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
+        critic_loss /= self.accumulation_steps  # gradient accumulation
         critic_loss.backward()
         critic_grad_norm = self.model.fake_score.clip_grad_norm_(
             self.max_grad_norm_critic)
@@ -314,27 +358,35 @@ class Trainer:
 
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            accumulate_now = self.step % self.accumulation_steps == 0
+            accumulate_next = (self.step + 1) % self.accumulation_steps == 0
 
             # Train the generator
             if TRAIN_GENERATOR:
-                self.generator_optimizer.zero_grad(set_to_none=True)
+                if accumulate_now:
+                    self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
                 batch = next(self.dataloader)
                 extra = self.fwdbwd_one_step(batch, True)
                 extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
-                self.generator_optimizer.step()
-                if self.generator_ema is not None:
-                    self.generator_ema.update(self.model.generator)
+
+                if accumulate_next:
+                    self.generator_optimizer.step()
+                    if self.generator_ema is not None:
+                        self.generator_ema.update(self.model.generator)
 
             # Train the critic
-            self.critic_optimizer.zero_grad(set_to_none=True)
+            if accumulate_now:
+                self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
             batch = next(self.dataloader)
             extra = self.fwdbwd_one_step(batch, False)
             extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
-            self.critic_optimizer.step()
+
+            if accumulate_next:
+                self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update
             self.step += 1
