@@ -370,11 +370,14 @@ class Trainer:
 
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
-            accumulate_now = self.step % self.accumulation_steps == 0
-            accumulate_next = (self.step + 1) % self.accumulation_steps == 0
 
             # Train the generator
             if TRAIN_GENERATOR:
+                generator_train_step = self.step // self.config.dfake_gen_update_ratio
+
+                accumulate_now = generator_train_step % self.accumulation_steps == 0
+                accumulate_next = (generator_train_step + 1) % self.accumulation_steps == 0
+
                 if accumulate_now:
                     self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
@@ -388,6 +391,8 @@ class Trainer:
                     if self.generator_ema is not None:
                         self.generator_ema.update(self.model.generator)
 
+            accumulate_now = self.step % self.accumulation_steps == 0
+            accumulate_next = (self.step + 1) % self.accumulation_steps == 0
             # Train the critic
             if accumulate_now:
                 self.critic_optimizer.zero_grad(set_to_none=True)
